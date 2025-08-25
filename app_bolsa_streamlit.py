@@ -1,25 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-Mini App IBEX35 → Última Cotización (EODHD)
+Mini App IBEX35 → Última Cotización (SOLO Alpha Vantage)
 Autor: ChatGPT (GPT-5 Thinking)
 
-Objetivo: app mínima que selecciona una empresa del IBEX35 y muestra su **última
-cotización** usando **EODHD.com** (tu clave API).
+⚠️ Esta versión **elimina por completo EODHD**. Solo usa **Alpha Vantage**.
 
-Dependencias mínimas para Streamlit Cloud:
+Dependencias mínimas:
     streamlit==1.37.1
     requests==2.32.3
 
-Cómo usar en Streamlit Cloud:
-- En la barra lateral introduce tu **API Key** de EODHD (o usa st.secrets / env).
-- Selecciona una empresa del IBEX35 y verás precio, cambio y hora.
-
 Notas:
-- Endpoint usado: `GET https://eodhd.com/api/real-time/{symbol}?api_token=...&fmt=json`
-- Símbolos de IBEX en EODHD usan sufijo **.MC** (Madrid).
-- Si `eodhd.com` falla, hay fallback a `eodhistoricaldata.com`.
-- Botón "Actualizar" limpia caché para reintentar.
-- Modo Debug muestra JSON crudo.
+- Endpoint: GLOBAL_QUOTE → https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=...&apikey=...
+- Límite plan gratuito: ~5 req/min y ~500 req/día → he puesto `st.cache_data(ttl=60)` para ahorrar llamadas.
+- Para símbolos IBEX (`.MC`) pruebo variantes si la respuesta viene vacía: `SAN.MC` → `SAN` → `BME:SAN`.
 """
 
 from __future__ import annotations
@@ -36,7 +29,7 @@ import streamlit as st
 # ============================
 st.set_page_config(page_title="IBEX35 · Última Cotización", page_icon="💶", layout="centered")
 
-# Lista estática IBEX35 (símbolo EOD/Yahoo + nombre). Última revisión: 2025-08-25.
+# Lista estática IBEX35 (símbolo + nombre). Última revisión: 2025-08-25.
 IBEX35: List[Tuple[str, str]] = [
     ("ACS.MC", "ACS"), ("ACX.MC", "Acerinox"), ("AENA.MC", "Aena"), ("ALM.MC", "Almirall"),
     ("ANA.MC", "Acciona"), ("BBVA.MC", "BBVA"), ("BKT.MC", "Bankinter"), ("CABK.MC", "CaixaBank"),
@@ -49,7 +42,7 @@ IBEX35: List[Tuple[str, str]] = [
 ]
 
 # ============================
-# EODHD endpoints y helpers
+# HTTP helpers
 # ============================
 UA_HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
@@ -58,10 +51,7 @@ UA_HEADERS = {
     "Connection": "keep-alive",
 }
 
-EOD_BASES = [
-    "https://eodhd.com/api/real-time/{symbol}",
-    "https://eodhistoricaldata.com/api/real-time/{symbol}",  # fallback alias
-]
+AV_URL = "https://www.alphavantage.co/query"
 
 
 def _get_json(url: str, params: Optional[Dict] = None, timeout: int = 15) -> tuple[Optional[Dict], Optional[str]]:
@@ -73,48 +63,72 @@ def _get_json(url: str, params: Optional[Dict] = None, timeout: int = 15) -> tup
         return None, f"HTTP error: {e}"
 
 
-@st.cache_data(ttl=30)
-def fetch_quote_eod(symbol: str, api_key: str) -> Dict:
-    """Obtiene la última cotización desde EODHD con fallback de dominio.
-    Devuelve dict normalizado:
-        price, currency, change, change_pct, prev_close, ts, source, raw
-    """
+def _get_secret(name: str, default: str = "") -> str:
+    return st.secrets.get(name, "") or os.getenv(name, "") or default
+
+# ============================
+# Alpha Vantage
+# ============================
+@st.cache_data(ttl=60)
+def fetch_quote_av(symbol: str, api_key: str, try_variants: bool = True) -> Dict:
     if not api_key:
         return {}
-    params = {"api_token": api_key, "fmt": "json"}
-    last_err = None
-    for base in EOD_BASES:
-        url = base.format(symbol=symbol)
-        js, err = _get_json(url, params=params)
-        if js and isinstance(js, dict) and js.get("code") or js.get("close") or js.get("timestamp"):
-            # Normaliza campos típicos de EODHD
-            price = js.get("close") if js.get("close") is not None else js.get("last")
-            return {
-                "price": price,
-                "currency": js.get("currency"),
-                "change": js.get("change"),
-                "change_pct": js.get("change_p"),
-                "prev_close": js.get("previousClose"),
-                "ts": js.get("timestamp"),
-                "source": "eodhd_realtime",
-                "raw": js,
-            }
-        last_err = err or "Respuesta vacía"
-    # Si llega aquí, no se pudo
+
+    def _parse_pct(txt: Optional[str]) -> Optional[float]:
+        if not txt:
+            return None
+        try:
+            return float(txt.strip().replace("%", ""))
+        except Exception:
+            return None
+
+    def _call_av(sym: str) -> Dict:
+        params = {"function": "GLOBAL_QUOTE", "symbol": sym, "apikey": api_key}
+        js, _ = _get_json(AV_URL, params=params)
+        if not js:
+            return {}
+        if js.get("Note") or js.get("Information") or js.get("Error Message"):
+            return {"_notice": js}
+        gq = js.get("Global Quote") or {}
+        price = gq.get("05. price")
+        out = {
+            "price": float(price) if price is not None else None,
+            "currency": "EUR" if sym.endswith(".MC") or sym.startswith("BME:") else None,
+            "change": float(gq.get("09. change")) if gq.get("09. change") is not None else None,
+            "change_pct": _parse_pct(gq.get("10. change percent")),
+            "prev_close": float(gq.get("08. previous close")) if gq.get("08. previous close") is not None else None,
+            "ts": None,  # GLOBAL_QUOTE no trae epoch
+            "source": f"alphavantage_global_quote:{sym}",
+            "raw": js,
+        }
+        return out if out["price"] is not None else {}
+
+    attempts = [symbol]
+    if try_variants:
+        base = symbol[:-3] if symbol.endswith(".MC") else symbol
+        if base != symbol:
+            attempts.append(base)
+        attempts.append(f"BME:{base}")
+
+    for sym in attempts:
+        res = _call_av(sym)
+        if res and res.get("price") is not None:
+            return res
     return {}
 
 # ============================
 # UI
 # ============================
-st.title("IBEX35 → Última cotización (EODHD)")
-st.caption("Fuente: EODHD.com (requiere API Key).")
+st.title("IBEX35 → Última cotización")
+st.caption("Fuente: Alpha Vantage (GLOBAL_QUOTE)")
 
-# Barra lateral: API Key
+# Sidebar: API key (persistente en session_state)
+if "av_key" not in st.session_state:
+    st.session_state.av_key = _get_secret("ALPHAVANTAGE_API_KEY", "")
+
 with st.sidebar:
-    st.subheader("🔑 EODHD API Key")
-    default_key = st.secrets.get("EODHD_API_KEY", "") or os.getenv("EODHD_API_KEY", "") or "68acad3b6e47d5.39244974"
-    api_key = st.text_input("Introduce tu API Key", value=default_key, type="password")
-    st.caption("Puedes guardarla en st.secrets como EODHD_API_KEY o en la variable de entorno EODHD_API_KEY.")
+    st.subheader("🔑 Alpha Vantage API Key")
+    st.text_input("API Key (Alpha Vantage)", value=st.session_state.av_key, type="password", key="av_key")
     col_a, col_b = st.columns(2)
     with col_a:
         refresh = st.button("Actualizar", use_container_width=True)
@@ -131,12 +145,12 @@ selected_name = st.selectbox("Elige empresa", options=sorted(names), index=names
 
 if selected_name:
     symbol = name_to_symbol[selected_name]
-    data = fetch_quote_eod(symbol, api_key)
+    data = fetch_quote_av(symbol, st.session_state.av_key)
 
     if not data:
-        st.error("No se pudo obtener la cotización desde EODHD. Verifica la API Key o inténtalo de nuevo.")
+        st.error("No se pudo obtener la cotización desde Alpha Vantage. Verifica la API Key o inténtalo de nuevo.")
         if debug:
-            st.info("Comprueba que el símbolo existe en EODHD (formato TICKER.MC) y que tu plan permite tiempo real.")
+            st.info("Activa una clave válida y asegúrate de no exceder los límites del plan gratuito (5 req/min).")
         st.stop()
 
     price = data.get("price")
@@ -145,17 +159,12 @@ if selected_name:
     change_pct = data.get("change_pct")
     prev_close = data.get("prev_close")
     ts = data.get("ts")
-    source = data.get("source")
+    source_used = data.get("source")
 
-    when_str = "—"
-    try:
-        if ts:
-            when = datetime.fromtimestamp(int(ts), tz=ZoneInfo("Europe/Madrid"))
-            when_str = when.strftime("%Y-%m-%d %H:%M:%S %Z")
-    except Exception:
-        pass
+    when_str = "—"  # AV no trae timestamp en GLOBAL_QUOTE
 
     st.subheader(f"{selected_name} ({symbol})")
+    st.caption(f"**Fuente real**: {source_used}")
     k1, k2, k3 = st.columns(3)
     with k1:
         st.metric("Último", f"{price if price is not None else '—'} {currency or ''}")
@@ -178,7 +187,7 @@ if selected_name:
     with k3:
         st.metric("Cierre previo", prev_close if prev_close is not None else "—")
 
-    st.caption(f"Hora de mercado: {when_str} · Fuente: {source}")
+    st.caption(f"Hora de mercado: {when_str}")
 
     if debug:
         with st.expander("Detalles técnicos (JSON crudo)"):
@@ -188,12 +197,20 @@ if selected_name:
 # Tests rápidos
 # ============================
 st.divider()
-st.markdown("### 🧪 Test rápido EODHD")
-if st.button("Probar SAN.MC e ITX.MC"):
-    st.cache_data.clear()
-    res = {sym: bool(fetch_quote_eod(sym, api_key)) for sym in ("SAN.MC", "ITX.MC")}
-    st.write({k: ("OK" if v else "FAIL") for k,v in res.items()})
-    if all(res.values()):
-        st.success("Tests OK: EODHD devolvió cotizaciones.")
-    else:
-        st.warning("Alguno de los símbolos no devolvió datos. Revisa la API Key o la disponibilidad.")
+st.markdown("### 🧪 Test rápido (Alpha Vantage)")
+col_t1, col_t2 = st.columns(2)
+with col_t1:
+    if st.button("Probar SAN.MC e ITX.MC"):
+        st.cache_data.clear()
+        res = {sym: bool(fetch_quote_av(sym, st.session_state.av_key)) for sym in ("SAN.MC", "ITX.MC")}
+        st.write({k: ("OK" if v else "FAIL") for k,v in res.items()})
+        if all(res.values()):
+            st.success("Tests OK: Alpha Vantage devolvió cotizaciones.")
+        else:
+            st.warning("Alguno de los símbolos no devolvió datos. Revisa la API Key / límites / soporte de símbolos.")
+with col_t2:
+    if st.button("Probar variantes de SAN (SAN.MC → SAN → BME:SAN)"):
+        st.cache_data.clear()
+        variants = ["SAN.MC", "SAN", "BME:SAN"]
+        res = {sym: bool(fetch_quote_av(sym, st.session_state.av_key, try_variants=False)) for sym in variants}
+        st.write({k: ("OK" if v else "FAIL") for k,v in res.items()})
