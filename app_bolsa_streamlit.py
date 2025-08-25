@@ -23,7 +23,8 @@ Características (modo CLI si no hay Streamlit):
 - Ejecuta tests automáticos con `--run-tests`.
 
 Requisitos recomendados:
-    pip install pandas requests lxml python-dateutil plotly yfinance streamlit
+    # Para Streamlit Cloud, evita paquetes que compilen binarios (quitamos lxml)
+    pip install streamlit pandas requests python-dateutil plotly yfinance
 
 """
 
@@ -175,42 +176,48 @@ def load_otherlisted_table() -> pd.DataFrame:
 
 @cache_data(ttl=3600)
 def load_ibex35_table() -> pd.DataFrame:
-    """Intenta leer la composición del IBEX 35 desde Wikipedia (ES -> EN como fallback)."""
-    def _parse_ibex(url: str) -> Optional[pd.DataFrame]:
-        try:
-            tables = pd.read_html(url)
-        except Exception:
-            return None
-        candidates = []
-        for t in tables:
-            cols = [c.lower() for c in t.columns.astype(str).tolist()]
-            if any('compañ' in c or 'company' in c for c in cols) and any('ticker' in c or 'código' in c or 'codigo' in c for c in cols):
-                candidates.append(t)
-        if not candidates:
-            return None
-        t = max(candidates, key=lambda x: x.shape[1])
-        t.columns = [str(c).strip().lower() for c in t.columns]
-        name_col = next((c for c in t.columns if c in ('compañía','compañía\u200b','company','empresa','nombre')), None)
-        ticker_col = next((c for c in t.columns if 'ticker' in c or 'código' in c or 'codigo' in c), None)
-        if ticker_col is None:
-            return None
-        out = t[[ticker_col] + ([name_col] if name_col else [])].copy()
-        out.rename(columns={ticker_col: 'raw_ticker'}, inplace=True)
-        if name_col:
-            out.rename(columns={name_col: 'name'}, inplace=True)
-        else:
-            out['name'] = ''
-        out['raw_ticker'] = out['raw_ticker'].astype(str).str.strip()
-        out['symbol'] = out['raw_ticker'].str.replace(r"\[.*?\]", "", regex=True)
-        out['symbol_yf'] = out['symbol'].str.replace(" ", "", regex=False).str.upper() + '.MC'
-        out['exchange'] = 'BME'
-        return out[['symbol_yf','name','exchange']].rename(columns={'symbol_yf':'symbol'})
-
-    df = _parse_ibex(IBEX_WIKI_ES)
-    if df is None or df.empty:
-        df = _parse_ibex(IBEX_WIKI_EN)
-    if df is None:
-        df = pd.DataFrame(columns=['symbol','name','exchange'])
+    """Obtiene la composición del IBEX 35.
+    Para evitar dependencias pesadas (lxml/bs4) en Streamlit Cloud, usamos una
+    **lista estática** mantenida en código como fallback estable.
+    """
+    # Fuente estática (símbolo Yahoo + nombre). Última revisión: 2025-08-25.
+    STATIC_IBEX = [
+        ("ACS.MC", "ACS"),
+        ("AENA.MC", "Aena"),
+        ("ALM.MC", "Almirall"),
+        ("ANA.MC", "Acciona"),
+        ("BBVA.MC", "BBVA"),
+        ("BKT.MC", "Bankinter"),
+        ("CABK.MC", "CaixaBank"),
+        ("CLNX.MC", "Cellnex"),
+        ("COL.MC", "Inmobiliaria Colonial"),
+        ("ELE.MC", "Endesa"),
+        ("ENG.MC", "Enagás"),
+        ("FER.MC", "Ferrovial"),
+        ("GRF.MC", "Grifols"),
+        ("IBE.MC", "Iberdrola"),
+        ("ITX.MC", "Inditex"),
+        ("IAG.MC", "IAG"),
+        ("MAP.MC", "Mapfre"),
+        ("MEL.MC", "Meliá Hotels"),
+        ("MRL.MC", "Merlin Properties"),
+        ("NTGY.MC", "Naturgy"),
+        ("PHM.MC", "PharmaMar"),
+        ("REE.MC", "Redeia (REE)"),
+        ("RMED.MC", "Rovi"),
+        ("SAB.MC", "Banco Sabadell"),
+        ("SAN.MC", "Banco Santander"),
+        ("SGRE.MC", "Siemens Gamesa*"),
+        ("SLR.MC", "Solaria"),
+        ("TEF.MC", "Telefónica"),
+        ("VIS.MC", "Viscofan"),
+        ("LOG.MC", "Logista"),
+        ("ROVI.MC", "Laboratorios Rovi"),
+    ]
+    # Nota: La composición puede variar; para un listado “oficial” podríamos
+    # añadir una opción avanzada para leer desde Wikipedia si bs4/lxml están disponibles.
+    df = pd.DataFrame(STATIC_IBEX, columns=["symbol","name"])
+    df["exchange"] = "BME"
     return df.reset_index(drop=True)
 
 # ============================
@@ -498,7 +505,7 @@ def run_streamlit_app():
 
     with st.sidebar:
         st.title("📈 App de Bolsa")
-        st.caption("Datos: Yahoo Finance (API), NasdaqTrader, Wikipedia")
+        st.caption("Datos: Yahoo Finance (API), NasdaqTrader; IBEX con lista estática")
         if HAS_YF:
             st.success("Fuente activos: yfinance ✅")
         else:
@@ -572,10 +579,13 @@ def run_streamlit_app():
                 ok2 = isinstance(k, dict)
                 df_test3 = get_history("SAN.MC", start=now - relativedelta(months=6), end=now)
                 ok3 = not df_test3.empty
-                if ok1 and ok2 and ok3:
-                    st.success("Tests OK: histórico AAPL, KPIs y SAN.MC cargados correctamente.")
+                # Nuevo test: IBEX lista estática cargada
+                df_ibex = load_ibex35_table()
+                ok4 = (not df_ibex.empty) and ("SAN.MC" in df_ibex['symbol'].values)
+                if ok1 and ok2 and ok3 and ok4:
+                    st.success("Tests OK: AAPL histórico/KPIs, SAN.MC histórico y lista IBEX cargada.")
                 else:
-                    st.warning(f"Resultados: hist AAPL={'OK' if ok1 else 'FAIL'}, KPIs={'OK' if ok2 else 'FAIL'}, hist SAN.MC={'OK' if ok3 else 'FAIL'}")
+                    st.warning(f"Resultados: hist AAPL={'OK' if ok1 else 'FAIL'}, KPIs={'OK' if ok2 else 'FAIL'}, hist SAN.MC={'OK' if ok3 else 'FAIL'}, IBEX={'OK' if ok4 else 'FAIL'}")
             except Exception as e:
                 st.error(f"Fallo en tests: {e}")
 
@@ -689,7 +699,7 @@ def run_streamlit_app():
     csv = hist_res.to_csv(index=False).encode('utf-8')
     st.download_button("Descargar CSV", data=csv, file_name=f"{selected_symbol}_{sel_range}_{res_label}.csv", mime="text/csv")
 
-    st.caption("ⓘ Fuentes: Yahoo Finance (API pública no oficial), NasdaqTrader, Wikipedia. Para KPIs completos, instala `yfinance`.")
+    st.caption("ⓘ Fuentes: Yahoo Finance (API pública no oficial) y NasdaqTrader. IBEX con lista estática para evitar dependencias pesadas en el despliegue. Para KPIs completos, instala `yfinance`.")
 
 # ============================
 # CLI fallback (sin Streamlit)
@@ -760,3 +770,4 @@ if __name__ == '__main__':
         run_streamlit_app()
     else:
         run_cli()
+
