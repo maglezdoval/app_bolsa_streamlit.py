@@ -1,216 +1,220 @@
 # -*- coding: utf-8 -*-
 """
-Mini App IBEX35 → Última Cotización (SOLO Alpha Vantage)
+Mini App → Cotizaciones por índice **vía Web Scraping**
 Autor: ChatGPT (GPT-5 Thinking)
 
-⚠️ Esta versión **elimina por completo EODHD**. Solo usa **Alpha Vantage**.
+⚠️ Estrategia: **solo scraping** (sin APIs externas). 
+Fuentes:
+  - **S&P 500** → slickcharts.com/sp500
+  - **NASDAQ 100** → slickcharts.com/nasdaq100
+  - **IBEX 35** → tradingview.com/symbols/BME-IBC/components/
+
+Notas importantes:
+- Sin `pandas.read_html` ni `bs4` para evitar dependencias pesadas (y problemas de deploy).
+- Parseo con **regex** sobre el HTML (estructura observada el 2025-08-26).
+- Los sitios pueden cambiar su marcado; si algo rompe, activa **Debug** para ver el HTML parcial.
+- Límite llamadas: caché `ttl=60s` y botón **Actualizar** para forzar refresco.
 
 Dependencias mínimas:
     streamlit==1.37.1
     requests==2.32.3
 
-Notas:
-- Endpoint: GLOBAL_QUOTE → https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=...&apikey=...
-- Límite plan gratuito: ~5 req/min y ~500 req/día → he puesto `st.cache_data(ttl=60)` para ahorrar llamadas.
-- Para símbolos IBEX (`.MC`) pruebo variantes si la respuesta viene vacía: `SAN.MC` → `SAN` → `BME:SAN`.
 """
 
 from __future__ import annotations
+from typing import List, Dict, Optional
+from dataclasses import dataclass
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from typing import Dict, List, Tuple, Optional
+import re
 import os
-import json
 import requests
 import streamlit as st
 
 # ============================
-# Configuración
+# Configuración general
 # ============================
-st.set_page_config(page_title="IBEX35 · Última Cotización", page_icon="💶", layout="centered")
+st.set_page_config(page_title="Scraping Cotizaciones (IBEX · NASDAQ100 · S&P500)", page_icon="📈", layout="wide")
 
-# Lista estática IBEX35 (símbolo + nombre). Última revisión: 2025-08-25.
-IBEX35: List[Tuple[str, str]] = [
-    ("ACS.MC", "ACS"), ("ACX.MC", "Acerinox"), ("AENA.MC", "Aena"), ("ALM.MC", "Almirall"),
-    ("ANA.MC", "Acciona"), ("BBVA.MC", "BBVA"), ("BKT.MC", "Bankinter"), ("CABK.MC", "CaixaBank"),
-    ("CLNX.MC", "Cellnex"), ("COL.MC", "Colonial"), ("ELE.MC", "Endesa"), ("ENG.MC", "Enagás"),
-    ("FER.MC", "Ferrovial"), ("GRF.MC", "Grifols"), ("IBE.MC", "Iberdrola"), ("ITX.MC", "Inditex"),
-    ("IAG.MC", "IAG"), ("LOG.MC", "Logista"), ("MAP.MC", "Mapfre"), ("MEL.MC", "Meliá Hotels"),
-    ("MRL.MC", "Merlin Properties"), ("NTGY.MC", "Naturgy"), ("PHM.MC", "PharmaMar"),
-    ("REE.MC", "Redeia (REE)"), ("ROVI.MC", "Laboratorios Rovi"), ("SAB.MC", "Banco Sabadell"),
-    ("SAN.MC", "Banco Santander"), ("SLR.MC", "Solaria"), ("TEF.MC", "Telefónica"), ("VIS.MC", "Viscofan"),
-]
-
-# ============================
-# HTTP helpers
-# ============================
+MAD = ZoneInfo("Europe/Madrid")
 UA_HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
     "Connection": "keep-alive",
+    "Cache-Control": "no-cache",
 }
 
-AV_URL = "https://www.alphavantage.co/query"
-
-
-def _get_json(url: str, params: Optional[Dict] = None, timeout: int = 15) -> tuple[Optional[Dict], Optional[str]]:
-    try:
-        r = requests.get(url, params=params, headers=UA_HEADERS, timeout=timeout)
-        r.raise_for_status()
-        return r.json(), None
-    except Exception as e:
-        return None, f"HTTP error: {e}"
-
-
-def _get_secret(name: str, default: str = "") -> str:
-    return st.secrets.get(name, "") or os.getenv(name, "") or default
+@dataclass
+class Row:
+    symbol: str
+    price: Optional[float]
+    pct: Optional[float] = None
+    name: Optional[str] = None
 
 # ============================
-# Alpha Vantage
+# HTTP util
 # ============================
 @st.cache_data(ttl=60)
-def fetch_quote_av(symbol: str, api_key: str, try_variants: bool = True) -> Dict:
-    if not api_key:
-        return {}
+def fetch_html(url: str, timeout: int = 20) -> str:
+    r = requests.get(url, headers=UA_HEADERS, timeout=timeout)
+    r.raise_for_status()
+    return r.text
 
-    def _parse_pct(txt: Optional[str]) -> Optional[float]:
-        if not txt:
-            return None
+# ============================
+# Parsers
+# ============================
+SLICK_PATTERN = re.compile(
+    r"\u3011\s*([A-Z][A-Z0-9\.]{0,9})\s*\u3011.*?\s([0-9][0-9,]*\.?[0-9]*)\s[+\-0-9\.,]+\s*\([+\-0-9\.,]+%\)",
+    re.S,
+)
+# Explicación: "】SYMBOL】 ...   PRICE  CHG (PCT%)" en Slickcharts (ver HTML visible)
+
+TRADINGVIEW_ROW = re.compile(
+    r"\u3011\s*([A-Z]{1,6})\s*\u3011.*?\s([0-9]+(?:\.[0-9]+)?)\sEUR",
+    re.S,
+)
+# Explicación: "】ITX】 ... 43.46 EUR ..." en TradingView components IBEX
+
+
+def parse_slickcharts(html: str) -> List[Row]:
+    rows: List[Row] = []
+    for m in SLICK_PATTERN.finditer(html):
+        sym = m.group(1).strip()
+        price_txt = m.group(2).replace(",", "")
         try:
-            return float(txt.strip().replace("%", ""))
+            price = float(price_txt)
         except Exception:
-            return None
+            price = None
+        rows.append(Row(symbol=sym, price=price))
+    # Deduplicar conservando orden (por si aparecen símbolos repetidos)
+    seen = set()
+    out: List[Row] = []
+    for r in rows:
+        if r.symbol not in seen:
+            seen.add(r.symbol)
+            out.append(r)
+    return out
 
-    def _call_av(sym: str) -> Dict:
-        params = {"function": "GLOBAL_QUOTE", "symbol": sym, "apikey": api_key}
-        js, _ = _get_json(AV_URL, params=params)
-        if not js:
-            return {}
-        if js.get("Note") or js.get("Information") or js.get("Error Message"):
-            return {"_notice": js}
-        gq = js.get("Global Quote") or {}
-        price = gq.get("05. price")
-        out = {
-            "price": float(price) if price is not None else None,
-            "currency": "EUR" if sym.endswith(".MC") or sym.startswith("BME:") else None,
-            "change": float(gq.get("09. change")) if gq.get("09. change") is not None else None,
-            "change_pct": _parse_pct(gq.get("10. change percent")),
-            "prev_close": float(gq.get("08. previous close")) if gq.get("08. previous close") is not None else None,
-            "ts": None,  # GLOBAL_QUOTE no trae epoch
-            "source": f"alphavantage_global_quote:{sym}",
-            "raw": js,
-        }
-        return out if out["price"] is not None else {}
 
-    attempts = [symbol]
-    if try_variants:
-        base = symbol[:-3] if symbol.endswith(".MC") else symbol
-        if base != symbol:
-            attempts.append(base)
-        attempts.append(f"BME:{base}")
+def parse_tradingview_ibex(html: str) -> List[Row]:
+    rows: List[Row] = []
+    for m in TRADINGVIEW_ROW.finditer(html):
+        sym = m.group(1).strip()
+        try:
+            price = float(m.group(2))
+        except Exception:
+            price = None
+        rows.append(Row(symbol=f"{sym}.MC", price=price))  # anota sufijo .MC útil para otras vistas
+    # Deduplicar
+    seen = set()
+    out: List[Row] = []
+    for r in rows:
+        if r.symbol not in seen:
+            seen.add(r.symbol)
+            out.append(r)
+    return out
 
-    for sym in attempts:
-        res = _call_av(sym)
-        if res and res.get("price") is not None:
-            return res
-    return {}
+# ============================
+# Data providers por índice
+# ============================
+SOURCES = {
+    "S&P 500": "https://www.slickcharts.com/sp500",
+    "NASDAQ 100": "https://www.slickcharts.com/nasdaq100",
+    "IBEX 35": "https://www.tradingview.com/symbols/BME-IBC/components/",
+}
+
+@st.cache_data(ttl=60)
+def get_market_rows(market: str) -> List[Row]:
+    url = SOURCES[market]
+    html = fetch_html(url)
+    if market in ("S&P 500", "NASDAQ 100"):
+        return parse_slickcharts(html)
+    else:
+        return parse_tradingview_ibex(html)
 
 # ============================
 # UI
 # ============================
-st.title("IBEX35 → Última cotización")
-st.caption("Fuente: Alpha Vantage (GLOBAL_QUOTE)")
-
-# Sidebar: API key (persistente en session_state)
-if "av_key" not in st.session_state:
-    st.session_state.av_key = _get_secret("ALPHAVANTAGE_API_KEY", "")
+st.title("📊 Cotizaciones por índice · Web Scraping")
+st.caption("Fuentes: Slickcharts (S&P 500, Nasdaq 100) · TradingView (IBEX 35). Los sitios pueden cambiar su HTML.")
 
 with st.sidebar:
-    st.subheader("🔑 Alpha Vantage API Key")
-    st.text_input("API Key (Alpha Vantage)", value=st.session_state.av_key, type="password", key="av_key")
-    col_a, col_b = st.columns(2)
-    with col_a:
-        refresh = st.button("Actualizar", use_container_width=True)
-    with col_b:
-        debug = st.toggle("Debug")
+    market = st.radio("Elige mercado", ["IBEX 35", "NASDAQ 100", "S&P 500"], index=0)
+    refresh = st.button("Actualizar", use_container_width=True)
+    debug = st.toggle("Debug")
 
 if refresh:
     st.cache_data.clear()
 
-# Selector de empresa
-names = [name for _, name in IBEX35]
-name_to_symbol = {name: sym for sym, name in IBEX35}
-selected_name = st.selectbox("Elige empresa", options=sorted(names), index=names.index("Inditex") if "Inditex" in names else 0)
+try:
+    rows = get_market_rows(market)
+except Exception as e:
+    st.error(f"No se pudo obtener datos de {market}: {e}")
+    rows = []
 
-if selected_name:
-    symbol = name_to_symbol[selected_name]
-    data = fetch_quote_av(symbol, st.session_state.av_key)
+st.subheader(f"{market} — {len(rows)} valores")
 
-    if not data:
-        st.error("No se pudo obtener la cotización desde Alpha Vantage. Verifica la API Key o inténtalo de nuevo.")
-        if debug:
-            st.info("Activa una clave válida y asegúrate de no exceder los límites del plan gratuito (5 req/min).")
-        st.stop()
+# Filtro rápido por símbolo
+q = st.text_input("Filtrar por símbolo (p. ej., AAPL, MSFT, ITX.MC)", "")
+if q:
+    qq = q.strip().upper()
+    rows = [r for r in rows if qq in r.symbol.upper()]
 
-    price = data.get("price")
-    currency = data.get("currency")
-    change = data.get("change")
-    change_pct = data.get("change_pct")
-    prev_close = data.get("prev_close")
-    ts = data.get("ts")
-    source_used = data.get("source")
+# Tabla
+import pandas as pd  # pandas forma parte del entorno de Streamlit Cloud por defecto
 
-    when_str = "—"  # AV no trae timestamp en GLOBAL_QUOTE
+if rows:
+    df = pd.DataFrame([{"Símbolo": r.symbol, "Precio": r.price} for r in rows])
+    st.dataframe(df, use_container_width=True)
+else:
+    st.warning("No se obtuvieron filas. Pulsa Actualizar o activa Debug para inspeccionar HTML.")
 
-    st.subheader(f"{selected_name} ({symbol})")
-    st.caption(f"**Fuente real**: {source_used}")
-    k1, k2, k3 = st.columns(3)
-    with k1:
-        st.metric("Último", f"{price if price is not None else '—'} {currency or ''}")
-    with k2:
-        if (change is None) and (change_pct is None):
-            st.metric("Cambio", "—")
-        else:
-            parts = []
-            if change is not None:
-                try:
-                    parts.append(f"{float(change):+,.2f}")
-                except Exception:
-                    parts.append(str(change))
-            if change_pct is not None:
-                try:
-                    parts.append(f"({float(change_pct):+,.2f}%)")
-                except Exception:
-                    parts.append(f"({change_pct}%)")
-            st.metric("Cambio", " ".join(parts))
-    with k3:
-        st.metric("Cierre previo", prev_close if prev_close is not None else "—")
-
-    st.caption(f"Hora de mercado: {when_str}")
-
-    if debug:
-        with st.expander("Detalles técnicos (JSON crudo)"):
-            st.code(json.dumps(data.get("raw", {}), ensure_ascii=False, indent=2))
+# Debug
+if debug:
+    st.divider()
+    st.markdown("### Debug")
+    st.code(f"Fuente: {SOURCES[market]}")
+    try:
+        html = fetch_html(SOURCES[market])
+        # Muestra solo un fragmento para no saturar
+        snippet = html[:2000]
+        st.code(snippet)
+    except Exception as e:
+        st.error(f"Fetch HTML falló: {e}")
 
 # ============================
-# Tests rápidos
+# Tests rápidos (scrapers)
 # ============================
 st.divider()
-st.markdown("### 🧪 Test rápido (Alpha Vantage)")
-col_t1, col_t2 = st.columns(2)
-with col_t1:
-    if st.button("Probar SAN.MC e ITX.MC"):
+st.markdown("### 🧪 Tests de scraping")
+col1, col2, col3 = st.columns(3)
+with col1:
+    if st.button("Test S&P 500 (>= 50)"):
         st.cache_data.clear()
-        res = {sym: bool(fetch_quote_av(sym, st.session_state.av_key)) for sym in ("SAN.MC", "ITX.MC")}
-        st.write({k: ("OK" if v else "FAIL") for k,v in res.items()})
-        if all(res.values()):
-            st.success("Tests OK: Alpha Vantage devolvió cotizaciones.")
-        else:
-            st.warning("Alguno de los símbolos no devolvió datos. Revisa la API Key / límites / soporte de símbolos.")
-with col_t2:
-    if st.button("Probar variantes de SAN (SAN.MC → SAN → BME:SAN)"):
+        try:
+            n = len(get_market_rows("S&P 500"))
+            st.write({"count": n})
+            st.success("OK" if n >= 50 else "Demasiado pocos; puede haber cambio de HTML")
+        except Exception as e:
+            st.error(str(e))
+with col2:
+    if st.button("Test NASDAQ 100 (>= 30)"):
         st.cache_data.clear()
-        variants = ["SAN.MC", "SAN", "BME:SAN"]
-        res = {sym: bool(fetch_quote_av(sym, st.session_state.av_key, try_variants=False)) for sym in variants}
-        st.write({k: ("OK" if v else "FAIL") for k,v in res.items()})
+        try:
+            n = len(get_market_rows("NASDAQ 100"))
+            st.write({"count": n})
+            st.success("OK" if n >= 30 else "Demasiado pocos; puede haber cambio de HTML")
+        except Exception as e:
+            st.error(str(e))
+with col3:
+    if st.button("Test IBEX 35 (>= 20)"):
+        st.cache_data.clear()
+        try:
+            n = len(get_market_rows("IBEX 35"))
+            st.write({"count": n})
+            st.success("OK" if n >= 20 else "Demasiado pocos; puede haber cambio de HTML")
+        except Exception as e:
+            st.error(str(e))
+
+# EOF
